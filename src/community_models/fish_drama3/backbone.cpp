@@ -1089,10 +1089,18 @@ public:
         mem_.reset(execution_.backend());
     }
 
-    std::vector<float> run(const std::vector<float> & hidden) {
+    std::vector<float> run(const std::vector<float> & hidden, const Drama3CandidateRows & rows) {
         if (static_cast<int64_t>(hidden.size()) != config_.hidden_size) {
             throw std::runtime_error("Drama 3 backbone LM head hidden size mismatch");
         }
+        if (rows.eos < 0 || rows.eos >= config_.vocab_size || rows.begin < 0 || rows.count <= 0 ||
+            rows.begin + rows.count > config_.vocab_size) {
+            throw std::runtime_error("Drama 3 backbone LM head candidate rows are outside the vocabulary");
+        }
+        if (mem_.graph != nullptr && (rows.eos != rows_.eos || rows.begin != rows_.begin || rows.count != rows_.count)) {
+            release_graph();
+        }
+        rows_ = rows;
         ensure();
         core::write_tensor_f32(core::wrap_tensor(input_, core::TensorShape::from_dims({1, 1, config_.hidden_size})), hidden);
         if (core::compute_backend_graph(execution_.backend(), mem_.graph, nullptr, "drama3_backbone.lm_head") != GGML_STATUS_SUCCESS) {
@@ -1121,8 +1129,19 @@ private:
         auto x = core::make_tensor(input_ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, 1, config_.hidden_size}));
         input_ = x.tensor;
         ggml_set_input(input_);
-        x = modules::LinearModule({config_.hidden_size, config_.vocab_size, false}).build(ctx, x, weights_->lm_head);
-        output_ = core::ensure_backend_addressable_layout(ctx, x).tensor;
+        // Sampling only reads EOS and the contiguous semantic band, so project
+        // onto views of those rows instead of the full vocabulary. Views keep
+        // the quantized weights in place; nothing is copied or regenerated.
+        auto * weight = weights_->lm_head.weight.tensor;
+        auto * eos_rows = ggml_view_2d(ctx.ggml, weight, config_.hidden_size, 1, weight->nb[1],
+                                       static_cast<size_t>(rows_.eos) * weight->nb[1]);
+        auto * band_rows = ggml_view_2d(ctx.ggml, weight, config_.hidden_size, rows_.count, weight->nb[1],
+                                        static_cast<size_t>(rows_.begin) * weight->nb[1]);
+        auto * hidden = ggml_reshape_2d(ctx.ggml, x.tensor, config_.hidden_size, 1);
+        auto * logits = ggml_concat(ctx.ggml, ggml_mul_mat(ctx.ggml, eos_rows, hidden),
+                                    ggml_mul_mat(ctx.ggml, band_rows, hidden), 0);
+        output_ = core::ensure_backend_addressable_layout(
+            ctx, core::wrap_tensor(logits, core::TensorShape::from_dims({1, 1, rows_.count + 1}))).tensor;
         ggml_set_output(output_);
         mem_.graph = ggml_new_graph_custom(mem_.ctx.get(), 4096, false);
         ggml_build_forward_expand(mem_.graph, output_);
@@ -1141,6 +1160,7 @@ private:
     Drama3BackboneDecoderConfig config_;
     size_t graph_arena_bytes_;
     GraphMemory mem_;
+    Drama3CandidateRows rows_;
     ggml_tensor * input_ = nullptr;
     ggml_tensor * output_ = nullptr;
 };
@@ -1513,8 +1533,8 @@ public:
         return forward_.run(embeddings, steps);
     }
 
-    std::vector<float> lm_head(const std::vector<float> & hidden) {
-        return lm_head_.run(hidden);
+    std::vector<float> candidate_logits(const std::vector<float> & hidden, const Drama3CandidateRows & rows) {
+        return lm_head_.run(hidden, rows);
     }
 
     std::unique_ptr<Drama3BackboneDecoderRuntime::DecodeSession> create_decode_session(int64_t cache_steps);
@@ -1595,8 +1615,9 @@ Drama3BackboneDecoderForwardResult Drama3BackboneDecoderRuntime::forward_embeddi
     return impl_->forward_embeddings(embeddings, steps);
 }
 
-std::vector<float> Drama3BackboneDecoderRuntime::lm_head(const std::vector<float> & hidden) {
-    return impl_->lm_head(hidden);
+std::vector<float> Drama3BackboneDecoderRuntime::candidate_logits(
+    const std::vector<float> & hidden, const Drama3CandidateRows & rows) {
+    return impl_->candidate_logits(hidden, rows);
 }
 
 std::unique_ptr<Drama3BackboneDecoderRuntime::DecodeSession> Drama3BackboneDecoderRuntime::create_decode_session(int64_t cache_steps) {

@@ -165,11 +165,9 @@ Drama3Generation Drama3Generator::generate(const std::string & text, const std::
     std::vector<Drama3Frame> output_frames;
     Drama3Generation result;
     if (streaming) codec_->reset_decode_stream();
+    const Drama3CandidateRows candidate_rows{assets_->eos, assets_->tower.semantic_begin, assets_->tower.codebook_size};
     for (int64_t step = 0; step < sampling.max_frames; ++step) {
-        const auto logits = backbone_->lm_head(hidden);
-        std::vector<float> candidates(static_cast<size_t>(assets_->tower.codebook_size + 1));
-        candidates[0] = logits.at(assets_->eos);
-        std::copy_n(logits.begin() + assets_->tower.semantic_begin, assets_->tower.codebook_size, candidates.begin() + 1);
+        const auto candidates = backbone_->candidate_logits(hidden, candidate_rows);
         const int32_t first = sample(candidates, sampling.temperature, sampling.top_k, sampling.top_p, random);
         const int32_t second = sample(candidates, 1.0F, 30, 0.95F, random);
         const int32_t first_token = first == 0 ? assets_->eos : assets_->tower.semantic_begin + first - 1;
