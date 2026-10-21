@@ -40,6 +40,13 @@ struct Drama3BackboneDecoderConfig {
     bool profile_prefill_cache = false;
 };
 
+// LM head rows a decode step may sample: EOS, then the contiguous semantic band.
+struct Drama3CandidateRows {
+    int32_t eos = 0;
+    int64_t begin = 0;
+    int64_t count = 0;
+};
+
 struct Drama3BackboneDecoderForwardResult {
     std::vector<float> hidden;
     int64_t steps = 0;
@@ -61,7 +68,8 @@ public:
 
     std::vector<float> token_embedding(const std::vector<int32_t> & token_ids);
     Drama3BackboneDecoderForwardResult forward_embeddings(const std::vector<float> & embeddings, int64_t steps);
-    std::vector<float> lm_head(const std::vector<float> & hidden);
+    // Returns count + 1 logits ordered [EOS, begin, ..., begin + count - 1].
+    std::vector<float> candidate_logits(const std::vector<float> & hidden, const Drama3CandidateRows & rows);
     void release_graphs();
 
     class DecodeSession {
