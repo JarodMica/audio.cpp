@@ -16,25 +16,40 @@
 namespace engine::models::fish_drama3 {
 namespace {
 
+// Ranks candidates by logit, descending. Equal logits keep the lower index
+// first, which is the order the previous full stable_sort produced. Ranks at
+// or past top_k are always dropped, so only that prefix is sorted.
 int32_t sample(const std::vector<float> & logits, float temperature, int top_k,
                float top_p, std::mt19937 & random) {
     if (logits.empty()) throw std::runtime_error("Drama 3 sampler has no logits");
+    const auto ranks_before = [&](int32_t left, int32_t right) {
+        return logits[left] > logits[right] || (logits[left] == logits[right] && left < right);
+    };
+    if (temperature == 0 || top_k == 1) {
+        int32_t best = 0;
+        for (int32_t index = 1; index < static_cast<int32_t>(logits.size()); ++index) {
+            if (ranks_before(index, best)) best = index;
+        }
+        return best;
+    }
+    const size_t kept = std::min(logits.size(), static_cast<size_t>(top_k));
     std::vector<int32_t> order(logits.size());
     std::iota(order.begin(), order.end(), 0);
-    std::stable_sort(order.begin(), order.end(), [&](int32_t left, int32_t right) { return logits[left] > logits[right]; });
-    if (temperature == 0 || top_k == 1) return order.front();
+    std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(kept), order.end(), ranks_before);
     const double maximum = logits[order.front()] / temperature;
-    std::vector<double> probabilities(order.size());
+    std::vector<double> probabilities(kept);
     double total = 0;
-    for (size_t rank = 0; rank < order.size(); ++rank) {
+    for (size_t rank = 0; rank < kept; ++rank) {
         probabilities[rank] = std::exp(logits[order[rank]] / temperature - maximum);
         total += probabilities[rank];
     }
+    // top_p is measured against the mass of every candidate, not just top_k.
+    for (size_t rank = kept; rank < order.size(); ++rank) total += std::exp(logits[order[rank]] / temperature - maximum);
     if (!(total > 0) || !std::isfinite(total)) throw std::runtime_error("Drama 3 sampler encountered nonfinite logits");
     double cumulative = 0;
-    for (size_t rank = 0; rank < order.size(); ++rank) {
+    for (size_t rank = 0; rank < kept; ++rank) {
         cumulative += probabilities[rank] / total;
-        if (rank > 0 && (cumulative > top_p || rank >= static_cast<size_t>(top_k))) probabilities[rank] = 0;
+        if (rank > 0 && cumulative > top_p) probabilities[rank] = 0;
     }
     std::discrete_distribution<size_t> choice(probabilities.begin(), probabilities.end());
     return order[choice(random)];
