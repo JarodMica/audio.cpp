@@ -1647,6 +1647,7 @@ audiocpp_add_model(fish_drama3
         src/community_models/fish_drama3/backbone.cpp
         src/community_models/fish_drama3/generator.cpp
         src/community_models/fish_drama3/loader.cpp
+        src/community_models/fish_drama3/lora.cpp
         src/community_models/fish_drama3/prompt.cpp
         src/community_models/fish_drama3/session.cpp
         src/community_models/fish_drama3/tokenizer_text.cpp

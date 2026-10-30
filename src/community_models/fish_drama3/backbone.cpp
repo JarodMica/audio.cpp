@@ -1,4 +1,5 @@
 #include "engine/community_models/fish_drama3/backbone.h"
+#include "engine/community_models/fish_drama3/lora.h"
 
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
@@ -160,6 +161,18 @@ std::vector<int32_t> position_ids(int64_t steps) {
     return out;
 }
 
+void attach_lora(const Drama3BackboneDecoderConfig & config, const std::string & name, const core::TensorValue & weight) {
+    if (config.lora) config.lora->attach(name, weight.tensor);
+}
+
+// Adapted projections all pass through here, so a runtime LoRA reaches each one.
+core::TensorValue drama3_linear(core::ModuleBuildContext & ctx, const Drama3BackboneDecoderConfig & config,
+    const modules::LinearConfig & linear, const core::TensorValue & input, const modules::LinearWeights & weights) {
+    auto output = modules::LinearModule(linear).build(ctx, input, weights);
+    if (config.lora) output.tensor = config.lora->apply(ctx.ggml, input.tensor, output.tensor, weights.weight.tensor);
+    return output;
+}
+
 struct FullAttentionWeights {
     modules::LinearWeights q_proj;
     modules::LinearWeights k_proj;
@@ -249,6 +262,10 @@ FullAttentionWeights load_full_attention(
         config.hidden_size,
         config.heads * config.head_dim,
         false);
+    for (const auto & entry : {std::make_pair(".q_proj", &out.q_proj), std::make_pair(".k_proj", &out.k_proj),
+                               std::make_pair(".v_proj", &out.v_proj), std::make_pair(".o_proj", &out.o_proj)}) {
+        attach_lora(config, prefix + entry.first, entry.second->weight);
+    }
     for (const auto & entry : {std::make_pair(".q_norm", &out.q_norm), std::make_pair(".k_norm", &out.k_norm)}) {
         auto scale = source.require_f32(prefix + entry.first + ".weight", {config.head_dim});
         for (auto & value : scale) value += 1.0F;
@@ -280,6 +297,11 @@ LinearAttentionWeights load_linear_attention(
     out.a_log = store.load_f32_tensor(source, prefix + ".A_log", {config.linear_num_value_heads});
     out.norm = binding::norm_weight_from_source(store, source, prefix + ".norm", config.linear_value_head_dim);
     out.out_proj = binding::linear_from_source(store, source, prefix + ".out_proj", storage_type, config.hidden_size, value_dim, false);
+    for (const auto & entry : {std::make_pair(".in_proj_qkv", &out.in_proj_qkv), std::make_pair(".in_proj_z", &out.in_proj_z),
+                               std::make_pair(".in_proj_b", &out.in_proj_b), std::make_pair(".in_proj_a", &out.in_proj_a),
+                               std::make_pair(".out_proj", &out.out_proj)}) {
+        attach_lora(config, prefix + entry.first, entry.second->weight);
+    }
     return out;
 }
 
@@ -344,6 +366,10 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
         const int64_t layer_experts = c.experts_per_layer.empty() ? c.experts : c.experts_per_layer[static_cast<size_t>(layer)];
         out.router = weights->store->load_tensor(source, prefix + ".mlp.gate.weight", storage_type, {layer_experts, c.hidden_size});
         out.shared_gate = weights->store->load_tensor(source, prefix + ".mlp.shared_expert_gate.weight", storage_type, {1, c.hidden_size});
+        attach_lora(c, prefix + ".mlp.shared_expert.gate_proj", out.mlp_gate.weight);
+        attach_lora(c, prefix + ".mlp.shared_expert.up_proj", out.mlp_up.weight);
+        attach_lora(c, prefix + ".mlp.shared_expert.down_proj", out.mlp_down.weight);
+        attach_lora(c, prefix + ".mlp.shared_expert_gate", out.shared_gate);
         if (weights->disk_store) {
             out.disk_store = weights->disk_store.get();
             const auto backend = weights->cpu_execution && layer < c.cpu_expert_layers
@@ -377,6 +403,7 @@ std::shared_ptr<Drama3BackboneWeights> load_qwen35_weights(
             c.hidden_size,
             false);
     }
+    if (!c.tie_word_embeddings) attach_lora(c, c.lm_head_prefix, weights->lm_head.weight);
     weights->store->upload();
     if (weights->cpu_store) weights->cpu_store->upload();
     return weights;
@@ -441,9 +468,9 @@ Drama3MoeInputs build_moe_inputs(
     const Drama3BackboneLayerWeights & weights,
     const Drama3BackboneDecoderConfig & config,
     bool fused = false) {
-    auto gate = modules::LinearModule({config.hidden_size, config.intermediate_size, false}).build(ctx, x, weights.mlp_gate);
+    auto gate = drama3_linear(ctx, config, {config.hidden_size, config.intermediate_size, false}, x, weights.mlp_gate);
     gate = round_activation(ctx, gate, config);
-    auto up = modules::LinearModule({config.hidden_size, config.intermediate_size, false}).build(ctx, x, weights.mlp_up);
+    auto up = drama3_linear(ctx, config, {config.hidden_size, config.intermediate_size, false}, x, weights.mlp_up);
     up = round_activation(ctx, up, config);
     core::TensorValue gated;
     if (fused) {
@@ -455,8 +482,10 @@ Drama3MoeInputs build_moe_inputs(
     }
     gated = round_activation(ctx, gated, config);
     auto shared = round_activation(ctx,
-        modules::LinearModule({config.intermediate_size, config.hidden_size, false}).build(ctx, gated, weights.mlp_down), config);
-    auto * shared_scale = ggml_sigmoid(ctx.ggml, ggml_mul_mat(ctx.ggml, weights.shared_gate.tensor, x.tensor));
+        drama3_linear(ctx, config, {config.intermediate_size, config.hidden_size, false}, gated, weights.mlp_down), config);
+    auto * shared_logit = ggml_mul_mat(ctx.ggml, weights.shared_gate.tensor, x.tensor);
+    if (config.lora) shared_logit = config.lora->apply(ctx.ggml, x.tensor, shared_logit, weights.shared_gate.tensor);
+    auto * shared_scale = ggml_sigmoid(ctx.ggml, shared_logit);
     auto * shared_output = ggml_mul(ctx.ggml, shared.tensor, shared_scale);
     const int64_t steps = ggml_nelements(x.tensor) / config.hidden_size;
     auto * hidden = ggml_reshape_2d(ctx.ggml, x.tensor, config.hidden_size, steps);
@@ -524,7 +553,7 @@ core::TensorValue full_attention(
     const core::TensorValue & attention_mask,
     const FullAttentionWeights & weights,
     const Drama3BackboneDecoderConfig & config) {
-    auto q_gate = modules::LinearModule({config.hidden_size, config.heads * config.head_dim * 2, false}).build(ctx, input, weights.q_proj);
+    auto q_gate = drama3_linear(ctx, config, {config.hidden_size, config.heads * config.head_dim * 2, false}, input, weights.q_proj);
     q_gate = round_activation(ctx, q_gate, config);
     q_gate = reshape_heads(ctx, q_gate, config.heads, config.head_dim * 2);
     auto q = modules::SliceModule({3, 0, config.head_dim}).build(ctx, q_gate);
@@ -533,8 +562,8 @@ core::TensorValue full_attention(
         ctx,
         core::ensure_backend_addressable_layout(ctx, gate),
         core::TensorShape::from_dims({input.shape.dims[0], input.shape.dims[1], config.heads * config.head_dim}));
-    auto k = modules::LinearModule({config.hidden_size, config.kv_heads * config.head_dim, false}).build(ctx, input, weights.k_proj);
-    auto v = modules::LinearModule({config.hidden_size, config.kv_heads * config.head_dim, false}).build(ctx, input, weights.v_proj);
+    auto k = drama3_linear(ctx, config, {config.hidden_size, config.kv_heads * config.head_dim, false}, input, weights.k_proj);
+    auto v = drama3_linear(ctx, config, {config.hidden_size, config.kv_heads * config.head_dim, false}, input, weights.v_proj);
     k = round_activation(ctx, k, config);
     v = round_activation(ctx, v, config);
     k = reshape_heads(ctx, k, config.kv_heads, config.head_dim);
@@ -567,7 +596,7 @@ core::TensorValue full_attention(
     context = modules::MulModule{}.build(ctx, context, gate);
     context = round_activation(ctx, context, config);
     return round_activation(ctx,
-        modules::LinearModule({config.heads * config.head_dim, config.hidden_size, false}).build(ctx, context, weights.o_proj), config);
+        drama3_linear(ctx, config, {config.heads * config.head_dim, config.hidden_size, false}, context, weights.o_proj), config);
 }
 
 core::TensorValue full_attention_prefill_cached(
@@ -581,7 +610,7 @@ core::TensorValue full_attention_prefill_cached(
     const FullAttentionWeights & weights,
     const Drama3BackboneDecoderConfig & config) {
     const int64_t steps = input.shape.dims[1];
-    auto q_gate = modules::LinearModule({config.hidden_size, config.heads * config.head_dim * 2, false}).build(ctx, input, weights.q_proj);
+    auto q_gate = drama3_linear(ctx, config, {config.hidden_size, config.heads * config.head_dim * 2, false}, input, weights.q_proj);
     q_gate = round_activation(ctx, q_gate, config);
     q_gate = reshape_heads(ctx, q_gate, config.heads, config.head_dim * 2);
     auto q = modules::SliceModule({3, 0, config.head_dim}).build(ctx, q_gate);
@@ -590,8 +619,8 @@ core::TensorValue full_attention_prefill_cached(
         ctx,
         core::ensure_backend_addressable_layout(ctx, gate),
         core::TensorShape::from_dims({input.shape.dims[0], input.shape.dims[1], config.heads * config.head_dim}));
-    auto k = modules::LinearModule({config.hidden_size, config.kv_heads * config.head_dim, false}).build(ctx, input, weights.k_proj);
-    auto v = modules::LinearModule({config.hidden_size, config.kv_heads * config.head_dim, false}).build(ctx, input, weights.v_proj);
+    auto k = drama3_linear(ctx, config, {config.hidden_size, config.kv_heads * config.head_dim, false}, input, weights.k_proj);
+    auto v = drama3_linear(ctx, config, {config.hidden_size, config.kv_heads * config.head_dim, false}, input, weights.v_proj);
     k = round_activation(ctx, k, config);
     v = round_activation(ctx, v, config);
     k = reshape_heads(ctx, k, config.kv_heads, config.head_dim);
@@ -630,7 +659,7 @@ core::TensorValue full_attention_prefill_cached(
     context = modules::MulModule{}.build(ctx, context, gate);
     context = round_activation(ctx, context, config);
     return round_activation(ctx,
-        modules::LinearModule({config.heads * config.head_dim, config.hidden_size, false}).build(ctx, context, weights.o_proj), config);
+        drama3_linear(ctx, config, {config.heads * config.head_dim, config.hidden_size, false}, context, weights.o_proj), config);
 }
 
 core::TensorValue full_attention_cached(
@@ -643,7 +672,7 @@ core::TensorValue full_attention_cached(
     const core::TensorValue & cache_value,
     const FullAttentionWeights & weights,
     const Drama3BackboneDecoderConfig & config) {
-    auto q_gate = modules::LinearModule({config.hidden_size, config.heads * config.head_dim * 2, false}).build(ctx, input, weights.q_proj);
+    auto q_gate = drama3_linear(ctx, config, {config.hidden_size, config.heads * config.head_dim * 2, false}, input, weights.q_proj);
     q_gate = round_activation(ctx, q_gate, config);
     q_gate = reshape_heads(ctx, q_gate, config.heads, config.head_dim * 2);
     auto q = modules::SliceModule({3, 0, config.head_dim}).build(ctx, q_gate);
@@ -652,8 +681,8 @@ core::TensorValue full_attention_cached(
         ctx,
         core::ensure_backend_addressable_layout(ctx, gate),
         core::TensorShape::from_dims({input.shape.dims[0], input.shape.dims[1], config.heads * config.head_dim}));
-    auto k = modules::LinearModule({config.hidden_size, config.kv_heads * config.head_dim, false}).build(ctx, input, weights.k_proj);
-    auto v = modules::LinearModule({config.hidden_size, config.kv_heads * config.head_dim, false}).build(ctx, input, weights.v_proj);
+    auto k = drama3_linear(ctx, config, {config.hidden_size, config.kv_heads * config.head_dim, false}, input, weights.k_proj);
+    auto v = drama3_linear(ctx, config, {config.hidden_size, config.kv_heads * config.head_dim, false}, input, weights.v_proj);
     k = round_activation(ctx, k, config);
     v = round_activation(ctx, v, config);
     k = reshape_heads(ctx, k, config.kv_heads, config.head_dim);
@@ -699,7 +728,7 @@ core::TensorValue full_attention_cached(
     context = modules::MulModule{}.build(ctx, context, gate);
     context = round_activation(ctx, context, config);
     return round_activation(ctx,
-        modules::LinearModule({config.heads * config.head_dim, config.hidden_size, false}).build(ctx, context, weights.o_proj), config);
+        drama3_linear(ctx, config, {config.heads * config.head_dim, config.hidden_size, false}, context, weights.o_proj), config);
 }
 
 core::TensorValue repeat_head_values(
@@ -750,7 +779,7 @@ LinearAttentionCachedOutput linear_attention_prefill(
     const int64_t key_dim = config.linear_key_head_dim * config.linear_num_key_heads;
     const int64_t value_dim = config.linear_value_head_dim * config.linear_num_value_heads;
     const int64_t conv_dim = key_dim * 2 + value_dim;
-    auto qkv = modules::LinearModule({config.hidden_size, conv_dim, false}).build(ctx, input, weights.in_proj_qkv);
+    auto qkv = drama3_linear(ctx, config, {config.hidden_size, conv_dim, false}, input, weights.in_proj_qkv);
     qkv = round_activation(ctx, qkv, config);
     qkv = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, qkv);
     qkv = core::ensure_backend_addressable_layout(ctx, qkv);
@@ -793,11 +822,11 @@ LinearAttentionCachedOutput linear_attention_prefill(
     const int64_t key_repeats = config.linear_num_value_heads / config.linear_num_key_heads;
     query = repeat_linear_attention_heads(ctx, query, key_repeats);
     key = repeat_linear_attention_heads(ctx, key, key_repeats);
-    auto beta = modules::LinearModule({config.hidden_size, config.linear_num_value_heads, false}).build(ctx, input, weights.in_proj_b);
+    auto beta = drama3_linear(ctx, config, {config.hidden_size, config.linear_num_value_heads, false}, input, weights.in_proj_b);
     beta = round_activation(ctx, beta, config);
     beta = modules::SigmoidModule{}.build(ctx, beta);
     beta = round_activation(ctx, beta, config);
-    auto a = modules::LinearModule({config.hidden_size, config.linear_num_value_heads, false}).build(ctx, input, weights.in_proj_a);
+    auto a = drama3_linear(ctx, config, {config.hidden_size, config.linear_num_value_heads, false}, input, weights.in_proj_a);
     a = round_activation(ctx, a, config);
     auto dt_bias = repeat_head_values(ctx, weights.dt_bias, steps, config.linear_num_value_heads);
     a = modules::AddModule{}.build(ctx, a, dt_bias);
@@ -817,7 +846,7 @@ LinearAttentionCachedOutput linear_attention_prefill(
     current_delta = round_activation(ctx, current_delta, config);
     next_state = round_activation(ctx, next_state, config);
     next_state = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, next_state), state.shape);
-    auto z = modules::LinearModule({config.hidden_size, value_dim, false}).build(ctx, input, weights.in_proj_z);
+    auto z = drama3_linear(ctx, config, {config.hidden_size, value_dim, false}, input, weights.in_proj_z);
     z = round_activation(ctx, z, config);
     z = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, z), core::TensorShape::from_dims({steps, value_dim}));
     current_delta = modules::RMSNormModule({config.linear_value_head_dim, config.rms_norm_eps, true, false}).build(
@@ -831,7 +860,7 @@ LinearAttentionCachedOutput linear_attention_prefill(
     current_delta = modules::MulModule{}.build(ctx, current_delta, z_flat);
     current_delta = round_activation(ctx, current_delta, config);
     current_delta = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, current_delta), core::TensorShape::from_dims({1, steps, value_dim}));
-    auto output = modules::LinearModule({value_dim, config.hidden_size, false}).build(ctx, current_delta, weights.out_proj);
+    auto output = drama3_linear(ctx, config, {value_dim, config.hidden_size, false}, current_delta, weights.out_proj);
     output = round_activation(ctx, output, config);
     auto next_tail = modules::SliceModule({2, steps, config.linear_conv_kernel_dim - 1}).build(ctx, padded);
     next_tail = core::ensure_backend_addressable_layout(ctx, next_tail);
@@ -861,7 +890,7 @@ LinearAttentionCachedOutput linear_attention_cached(
     const int64_t key_dim = config.linear_key_head_dim * config.linear_num_key_heads;
     const int64_t value_dim = config.linear_value_head_dim * config.linear_num_value_heads;
     const int64_t conv_dim = key_dim * 2 + value_dim;
-    auto qkv = modules::LinearModule({config.hidden_size, conv_dim, false}).build(ctx, input, weights.in_proj_qkv);
+    auto qkv = drama3_linear(ctx, config, {config.hidden_size, conv_dim, false}, input, weights.in_proj_qkv);
     qkv = round_activation(ctx, qkv, config);
     qkv = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, qkv);
     qkv = core::ensure_backend_addressable_layout(ctx, qkv);
@@ -890,11 +919,11 @@ LinearAttentionCachedOutput linear_attention_cached(
     const int64_t key_repeats = config.linear_num_value_heads / config.linear_num_key_heads;
     query = repeat_linear_attention_heads(ctx, query, key_repeats);
     key = repeat_linear_attention_heads(ctx, key, key_repeats);
-    auto beta = modules::LinearModule({config.hidden_size, config.linear_num_value_heads, false}).build(ctx, input, weights.in_proj_b);
+    auto beta = drama3_linear(ctx, config, {config.hidden_size, config.linear_num_value_heads, false}, input, weights.in_proj_b);
     beta = round_activation(ctx, beta, config);
     beta = modules::SigmoidModule{}.build(ctx, beta);
     beta = round_activation(ctx, beta, config);
-    auto a = modules::LinearModule({config.hidden_size, config.linear_num_value_heads, false}).build(ctx, input, weights.in_proj_a);
+    auto a = drama3_linear(ctx, config, {config.hidden_size, config.linear_num_value_heads, false}, input, weights.in_proj_a);
     a = round_activation(ctx, a, config);
     auto dt_bias = repeat_head_values(ctx, weights.dt_bias, 1, config.linear_num_value_heads);
     a = modules::AddModule{}.build(ctx, a, dt_bias);
@@ -914,7 +943,7 @@ LinearAttentionCachedOutput linear_attention_cached(
     current_delta = round_activation(ctx, current_delta, config);
     next_state = round_activation(ctx, next_state, config);
     next_state = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, next_state), recurrent_state.shape);
-    auto z = modules::LinearModule({config.hidden_size, value_dim, false}).build(ctx, input, weights.in_proj_z);
+    auto z = drama3_linear(ctx, config, {config.hidden_size, value_dim, false}, input, weights.in_proj_z);
     z = round_activation(ctx, z, config);
     z = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, z), core::TensorShape::from_dims({1, value_dim}));
     current_delta = modules::RMSNormModule({config.linear_value_head_dim, config.rms_norm_eps, true, false}).build(
@@ -928,7 +957,7 @@ LinearAttentionCachedOutput linear_attention_cached(
     current_delta = modules::MulModule{}.build(ctx, current_delta, z_flat);
     current_delta = round_activation(ctx, current_delta, config);
     current_delta = core::reshape_tensor(ctx, core::ensure_backend_addressable_layout(ctx, current_delta), core::TensorShape::from_dims({1, 1, value_dim}));
-    auto output = modules::LinearModule({value_dim, config.hidden_size, false}).build(ctx, current_delta, weights.out_proj);
+    auto output = drama3_linear(ctx, config, {value_dim, config.hidden_size, false}, current_delta, weights.out_proj);
     output = round_activation(ctx, output, config);
     auto next_tail = modules::SliceModule({2, 1, config.linear_conv_kernel_dim - 1}).build(ctx, conv_input);
     next_tail = core::ensure_backend_addressable_layout(ctx, next_tail);
@@ -1199,9 +1228,9 @@ private:
         input_ = x.tensor;
         ggml_set_input(input_);
         if (config_.lm_head_rows > 0) {
-            x = modules::LinearModule({config_.hidden_size, config_.lm_head_rows, false}).build(ctx, x, weights_->lm_head);
+            x = drama3_linear(ctx, config_, {config_.hidden_size, config_.lm_head_rows, false}, x, weights_->lm_head);
         } else if (config_.lm_head_token_ids.empty()) {
-            x = modules::LinearModule({config_.hidden_size, config_.vocab_size, false}).build(ctx, x, weights_->lm_head);
+            x = drama3_linear(ctx, config_, {config_.hidden_size, config_.vocab_size, false}, x, weights_->lm_head);
         } else {
             const auto input = x;
             auto * head = weights_->lm_head.weight.tensor;
@@ -1219,6 +1248,7 @@ private:
                     core::TensorShape::from_dims({count, config_.hidden_size}), head->type);
                 auto logits = modules::LinearModule({config_.hidden_size, count, false}).build(
                     ctx, input, {weight, std::nullopt});
+                if (config_.lora) logits.tensor = config_.lora->apply(ctx.ggml, input.tensor, logits.tensor, head, token, count);
                 x = first == 0 ? logits : modules::ConcatModule({2}).build(ctx, x, logits);
                 first = end;
             }

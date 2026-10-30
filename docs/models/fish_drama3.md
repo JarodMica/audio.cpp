@@ -343,6 +343,31 @@ Descriptors accept `vq_codes` instead of `audio_path`: a nonempty integer grid
 with ten rows, one per codebook. Text accepts `<|speaker:0|>` through
 `<|speaker:15|>` and event tags such as `[sighs]` and `[laughs]`.
 
+## Runtime LoRA
+
+A low-rank adapter can run beside the base weights, so one loaded model serves
+both adapted and unadapted requests. Set the session option
+`fish_drama3.lora=<adapter.safetensors>` and send `use_lora=true` with the
+requests that should use it. Other requests use the base weights unchanged.
+`fish_drama3.lora_scale` multiplies the adapter's own alpha/rank scaling and
+defaults to 1.
+
+Adapters use A/B factors named after the model weights, for example
+`model.language_model.layers.0.self_attn.q_proj.lora_A` and `.lora_B`, with
+an optional `.alpha`. PEFT and ComfyUI A/B spellings are also read. Supported
+targets are the backbone attention, linear-attention, shared-expert and
+shared-expert-gate projections, the LM head, and the audio-tower projections
+and codebook heads. Routed experts and routers are not adapted. Every adapter
+target must match a model weight's shape.
+
+The factors stay in F32 on the selected backend. Switching between adapted and
+unadapted requests rewrites only the B factors, so cached graphs remain valid.
+With the adapter loaded, unadapted requests produce the same audio as a session
+without it.
+
+In a server configuration, put the adapter in the model's `session_options` and
+`use_lora` in a voice preset's `options`, so that a preset selects the adapted voice.
+
 ## Continuation and editing
 
 `previous_takes` is a JSON string containing ordered earlier takes. Each object

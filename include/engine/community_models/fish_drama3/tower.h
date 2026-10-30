@@ -14,6 +14,8 @@ namespace engine::models::fish_drama3 {
 
 using Drama3Frame = std::array<int32_t, 11>;
 
+class Drama3Lora;
+
 struct Drama3TowerConfig {
     int64_t hidden_size = 2048;
     int64_t intermediate_size = 6144;
@@ -28,6 +30,8 @@ struct Drama3TowerConfig {
     float norm_eps = 1e-6F;
     float rope_theta = 1e7F;
     float rotary_fraction = 0.25F;
+    // Optional runtime adapter; owned by the generator and outlives the tower.
+    Drama3Lora * lora = nullptr;
 };
 
 struct Drama3TowerOutput {

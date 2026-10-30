@@ -1,4 +1,5 @@
 #include "engine/community_models/fish_drama3/generator.h"
+#include "engine/community_models/fish_drama3/lora.h"
 
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/runtime/errors.h"
@@ -147,14 +148,22 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
     if (backbone_prefill_cache_mb < 0 || backbone_prefill_cache_mb > 4096) throw std::runtime_error("Drama 3 backbone_prefill_cache_mb must be between 0 and 4096");
     backbone_config.prefill_cache_bytes = static_cast<size_t>(backbone_prefill_cache_mb) * 1024u * 1024u;
     backbone_config.profile_prefill_cache = profile_first_audio_;
+    if (const auto path = runtime::find_option(options.options, {"fish_drama3.lora"}); path && !path->empty()) {
+        const auto strength = runtime::parse_finite_float_option(options.options, {"fish_drama3.lora_scale"}).value_or(1.0F);
+        lora_ = std::make_unique<Drama3Lora>(std::filesystem::u8path(*path), strength, execution);
+    }
+    backbone_config.lora = lora_.get();
     backbone_ = std::make_unique<Drama3BackboneDecoderRuntime>(assets_->model_weights, backbone_config, execution,
         64 * 1024 * 1024, 8 * 1024 * 1024, assets::TensorStorageType::Native);
     disk_experts_ = backbone_config.disk_experts;
     decoder_ = backbone_->create_decode_session(cache_steps_);
     const auto tower_prefill_cache_mb = runtime::parse_i64_option(options.options, {"fish_drama3.tower_prefill_cache_mb"}).value_or(256);
     if (tower_prefill_cache_mb < 0 || tower_prefill_cache_mb > 4096) throw std::runtime_error("Drama 3 tower_prefill_cache_mb must be between 0 and 4096");
-    tower_ = std::make_unique<Drama3Tower>(assets_->model_weights, assets_->tower, execution, cache_steps_,
+    auto tower_config = assets_->tower;
+    tower_config.lora = lora_.get();
+    tower_ = std::make_unique<Drama3Tower>(assets_->model_weights, tower_config, execution, cache_steps_,
         static_cast<size_t>(tower_prefill_cache_mb) * 1024u * 1024u);
+    if (lora_) lora_->require_all_attached();
     auto codec_backend = options.backend;
     if (const auto value = runtime::find_option(options.options, {"fish_drama3.codec_backend"})) {
         if (*value == "cpu") codec_backend.type = core::BackendType::Cpu;
@@ -183,6 +192,14 @@ Drama3Generator::Drama3Generator(std::shared_ptr<const Drama3Assets> assets,
 }
 
 Drama3Generator::~Drama3Generator() = default;
+
+void Drama3Generator::set_lora_enabled(bool enabled) {
+    if (!lora_) {
+        if (enabled) throw runtime::InvalidRequestError("use_lora requires the fish_drama3.lora session option");
+        return;
+    }
+    lora_->set_enabled(enabled);
+}
 
 codecs::FishDacCodes Drama3Generator::encode_reference(const runtime::AudioBuffer & audio) {
     if (cached_reference_audio_ && cached_reference_audio_->sample_rate == audio.sample_rate &&

@@ -11,6 +11,8 @@
 
 namespace engine::models::fish_drama3 {
 
+class Drama3Lora;
+
 struct Drama3BackboneDecoderConfig {
     int64_t vocab_size = 252288;
     int64_t hidden_size = 2048;
@@ -52,6 +54,8 @@ struct Drama3BackboneDecoderConfig {
     int64_t disk_expert_read_threads = 1;
     size_t prefill_cache_bytes = 256u * 1024u * 1024u;
     bool profile_prefill_cache = false;
+    // Optional runtime adapter; owned by the generator and outlives the backbone.
+    Drama3Lora * lora = nullptr;
 };
 
 struct Drama3BackboneDecoderForwardResult {

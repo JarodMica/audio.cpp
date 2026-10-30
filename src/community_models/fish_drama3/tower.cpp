@@ -1,4 +1,5 @@
 #include "engine/community_models/fish_drama3/tower.h"
+#include "engine/community_models/fish_drama3/lora.h"
 
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
@@ -151,6 +152,15 @@ public:
             w.down = load(transformer + ".feed_forward.w2.weight", {c.hidden_size, c.intermediate_size});
             if (!shared) w.head = load("audio_decoder_mtp.heads." + std::to_string(local_index) + ".weight",
                                       {c.codebook_size, c.hidden_size});
+            if (c.lora) {
+                c.lora->attach(prefix + ".eh_proj", w.eh);
+                c.lora->attach(transformer + ".attention.wqkv", w.qkv);
+                c.lora->attach(transformer + ".attention.wo", w.output);
+                c.lora->attach(transformer + ".feed_forward.w1", w.gate);
+                c.lora->attach(transformer + ".feed_forward.w3", w.up);
+                c.lora->attach(transformer + ".feed_forward.w2", w.down);
+                if (w.head) c.lora->attach("audio_decoder_mtp.heads." + std::to_string(local_index), w.head);
+            }
             layers_.push_back(w);
         }
         store_->upload();
@@ -371,7 +381,7 @@ private:
             hidden = build_layer(ctx, layer, 1, hidden, code, result->label_mask,
                 layer == 0 ? result->extra : nullptr, result->positions, result->attention_mask);
             if (!layers_[layer].head) continue;
-            auto * logits = ggml_mul_mat(ctx, layers_[layer].head, hidden);
+            auto * logits = project(ctx, layers_[layer].head, hidden);
             if (greedy) {
                 code = ggml_argmax(ctx, logits);
             } else {
@@ -452,6 +462,12 @@ private:
         }
     }
 
+    // Adapted projections all pass through here, so a runtime LoRA reaches each one.
+    ggml_tensor * project(ggml_context * ctx, ggml_tensor * weight, ggml_tensor * input) const {
+        auto * output = ggml_mul_mat(ctx, weight, input);
+        return config_.lora ? config_.lora->apply(ctx, input, output, weight) : output;
+    }
+
     ggml_tensor * build_layer(ggml_context * ctx, int64_t layer, int64_t steps,
                              ggml_tensor * hidden, ggml_tensor * codes, ggml_tensor * label_mask,
                              ggml_tensor * extra, ggml_tensor * positions, ggml_tensor * attention_mask) {
@@ -460,10 +476,10 @@ private:
         auto * embedding = ggml_get_rows(ctx, w.embedding, codes);
         embedding = ggml_mul(ctx, embedding, label_mask);
         if (extra) embedding = ggml_add(ctx, embedding, extra);
-        auto * mixed = ggml_mul_mat(ctx, w.eh, ggml_concat(ctx,
+        auto * mixed = project(ctx, w.eh, ggml_concat(ctx,
             gemma_norm(ctx, embedding, w.enorm, c.norm_eps),
             gemma_norm(ctx, hidden, w.hnorm, c.norm_eps), 0));
-        auto * qkv = ggml_mul_mat(ctx, w.qkv, gemma_norm(ctx, mixed, w.input_norm, c.norm_eps));
+        auto * qkv = project(ctx, w.qkv, gemma_norm(ctx, mixed, w.input_norm, c.norm_eps));
         const int64_t query_width = c.heads * c.head_dim;
         const int64_t kv_width = c.kv_heads * c.head_dim;
         auto * query = ggml_reshape_3d(ctx, columns(ctx, qkv, 0, query_width), c.head_dim, c.heads, steps);
@@ -483,10 +499,10 @@ private:
         ggml_flash_attn_ext_set_prec(attended, GGML_PREC_F32);
         attended = ggml_reshape_2d(ctx, attended, query_width, steps);
         attended = ggml_mul(ctx, attended, ggml_sigmoid(ctx, gate));
-        auto * x = ggml_add(ctx, mixed, ggml_mul_mat(ctx, w.output, attended));
+        auto * x = ggml_add(ctx, mixed, project(ctx, w.output, attended));
         auto * normed = gemma_norm(ctx, x, w.post_norm, c.norm_eps);
-        auto * ff = ggml_mul(ctx, ggml_silu(ctx, ggml_mul_mat(ctx, w.gate, normed)), ggml_mul_mat(ctx, w.up, normed));
-        return gemma_norm(ctx, ggml_add(ctx, x, ggml_mul_mat(ctx, w.down, ff)), w.final_norm, c.norm_eps);
+        auto * ff = ggml_mul(ctx, ggml_silu(ctx, project(ctx, w.gate, normed)), project(ctx, w.up, normed));
+        return gemma_norm(ctx, ggml_add(ctx, x, project(ctx, w.down, ff)), w.final_norm, c.norm_eps);
     }
 
     std::unique_ptr<LayerGraph> build_prefill_graph(int64_t steps) {
@@ -552,7 +568,7 @@ private:
         ggml_build_forward_expand(result->graph, result->output);
         // Prompt prefill needs the states, but does not sample codebook heads.
         if (w.head && steps == 1) {
-            result->logits = ggml_mul_mat(ctx, w.head, result->output);
+            result->logits = project(ctx, w.head, result->output);
             ggml_set_output(result->logits);
             ggml_build_forward_expand(result->graph, result->logits);
         }

@@ -32,9 +32,13 @@ public:
     Drama3Generation generate(const std::string & text, const std::vector<Drama3Take> & references,
         const std::vector<Drama3Take> & history, const Drama3Sampling & sampling, bool streaming,
         const std::function<void(const runtime::AudioBuffer &)> & on_audio = {}, bool continuation = false);
+    // Selects the runtime LoRA from fish_drama3.lora for the following generations.
+    void set_lora_enabled(bool enabled);
 
 private:
     std::shared_ptr<const Drama3Assets> assets_;
+    // Declared before the backbone and tower, whose graphs reference its tensors.
+    std::unique_ptr<Drama3Lora> lora_;
     Drama3TextTokenizer tokenizer_;
     int64_t cache_steps_;
     bool profile_first_audio_ = false;

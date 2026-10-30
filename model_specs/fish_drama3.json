@@ -122,6 +122,13 @@
         "description": "Reproducible native sampling seed.",
         "required": false,
         "min": 0
+      },
+      {
+        "name": "use_lora",
+        "type": "bool",
+        "description": "Apply the session's runtime LoRA (session option lora) to this request. Requests without it use the base weights.",
+        "required": false,
+        "default": false
       }
     ],
     "session": [
@@ -290,6 +297,19 @@
           "cpu"
         ],
         "default": "same"
+      },
+      {
+        "name": "lora",
+        "type": "string",
+        "description": "Path to a low-rank adapter (native .lora_A/.lora_B, PEFT or ComfyUI A/B factors named by model weight) evaluated beside the base weights. Requests opt in with use_lora; others are unchanged, so one loaded model serves both.",
+        "required": false
+      },
+      {
+        "name": "lora_scale",
+        "type": "float",
+        "description": "Strength multiplier for the runtime LoRA, on top of its alpha/rank scaling.",
+        "required": false,
+        "default": 1.0
       }
     ],
     "load": []

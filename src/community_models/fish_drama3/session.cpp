@@ -133,18 +133,22 @@ runtime::TaskResult Drama3Session::synthesize(const runtime::TaskRequest & reque
     if (!effective.text_input) throw runtime::InvalidRequestError("Drama 3 requires input text");
     Drama3Sampling sampling;
     std::optional<uint32_t> seed;
+    bool use_lora = false;
     try {
         sampling.temperature = runtime::parse_finite_float_option(effective.options, {"temperature"}).value_or(1.0F);
         sampling.top_p = runtime::parse_finite_float_option(effective.options, {"top_p"}).value_or(0.9F);
         sampling.top_k = runtime::parse_int_option(effective.options, {"top_k"}).value_or(4097);
         sampling.max_frames = runtime::parse_positive_i64_option(effective.options, {"max_tokens", "max_new_tokens"}, 1024);
         seed = runtime::parse_u32_option(effective.options, {"seed"});
+        if (const auto value = runtime::find_option(effective.options, {"use_lora"}))
+            use_lora = runtime::parse_bool_option(*value, "use_lora");
     } catch (const std::runtime_error & error) {
         throw runtime::InvalidRequestError(error.what());
     } catch (const std::logic_error & error) {
         throw runtime::InvalidRequestError(error.what());
     }
     sampling.seed = seed.value_or(runtime::random_u32_seed());
+    generator_->set_lora_enabled(use_lora);
     std::vector<Drama3Take> references;
     if (effective.voice && effective.voice->speaker && effective.voice->speaker->cached_voice_id &&
         !effective.voice->speaker->audio) {
